@@ -1,0 +1,19 @@
+{
+    "scripts": {
+        "clean": "rm -rf dist",
+        "build": "npx tsc",
+        "run": "node dist/index.js"
+    },
+    "devDependencies": {
+        "@types/aws-sdk": "^2.7.0",
+        "@types/node": "^12.7.5",
+        "typescript": "^3.6.3"
+    },
+    "dependencies": {
+        "aws-sdk": "^2.532.0",
+        "install": "^0.13.0",
+        "node": "^12.10.0",
+        "npm": "^6.11.3",
+        "util": "^0.12.1"
+    }
+}
