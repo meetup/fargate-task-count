@@ -3,21 +3,36 @@ import { runInThisContext } from 'vm';
 import { PromiseResult } from 'aws-sdk/lib/request';
 import { PerformanceObserver } from 'perf_hooks';
 import { SSL_OP_SSLEAY_080_CLIENT_DH_BUG } from 'constants';
-// import * as util from 'util';
 
-AWS.config.update({region: 'us-east-1'});
-var credentials = new AWS.SharedIniFileCredentials({profile: 'prod'});
-AWS.config.credentials = credentials;
+export interface ServiceStatus {
+    serviceName: string;
+    desiredCount: number;
+    runningCount: number;
+    pendingCount: number;
+    launchType: string;
+}
 
-const ecs = new AWS.ECS();
+//intermediary representation of cluster & services collection for single cluster
+interface ClusterAndServices {
+    cluster: string;
+    services: string[];
+}
+
+const EMPTY_SUMMARY: ServiceStatus = {
+    serviceName: "total",
+    desiredCount: 0,
+    runningCount: 0,
+    pendingCount: 0,
+    launchType: "FARGATE"
+}
 
 export function fargateCount(): Promise<ServiceStatus> {
-    const summary: Promise<ServiceStatus> = ecs.listClusters({}).promise()
-        .then(clusterNameCallback)
-        .then((s) => serviceNameCall(s)) //get ClusterAndServices[] promise
-        .then((obj) => serviceDescribeCalls(obj)) //get ServiceStatus[] promise
+    const summary: Promise<ServiceStatus> = fetchClusters()
+        .then(getClusterNames)
+        .then((s) => getServiceNames(s)) //get ClusterAndServices[] promise
+        .then((obj) => describeServices(obj)) //get ServiceStatus[] promise
         .then((obj) => addStats(obj)) //reduce all the stats into a single stat
-        .catch( (err: AWS.AWSError) => {
+        .catch( (err: AWS.AWSError) => { //still return an empty summary object when error happens. hm just error out might be better practice here.
             console.log(err);
             return EMPTY_SUMMARY;
         });
@@ -25,7 +40,7 @@ export function fargateCount(): Promise<ServiceStatus> {
 }
 // list clusters in account
 // AWS_PROFILE=prod aws ecs list-clusters
-const clusterNameCallback = 
+const getClusterNames = 
     function(data: AWS.ECS.Types.ListClustersResponse): Array<string> {
         var clusterNames: Array<string> = [];
         if(data && data.clusterArns) {
@@ -39,21 +54,14 @@ const clusterNameCallback =
         return clusterNames;
     };
 
-interface ClusterAndServices {
-    cluster: string;
-    services: string[];
-}
 //  list services in cluster
 //  AWS_PROFILE=prod aws ecs list-services --cluster meetup-prod-web-cluster
-const serviceNameCall = //returns [{clusterName,serviceNames}..]
+const getServiceNames = //returns [{clusterName,serviceNames}..]
     function(clusterNames:string[]): Promise<ClusterAndServices[]> {
-        //var clusterAndServices: ClusterAndServices[] = []
         const proms: Promise<ClusterAndServices>[] = clusterNames.map( 
             (clusterName) => {
-                return ecs
-                    .listServices({cluster: clusterName})
-                    .promise()
-                    .then(serviceNameCallback)
+                return fetchServicesForCluster(clusterName)
+                    .then(parseServiceNames)
                     .then((serviceNames) => new Promise<ClusterAndServices>((resolve) => {
                         //console.log(serviceNames);
                         resolve( {
@@ -65,10 +73,8 @@ const serviceNameCall = //returns [{clusterName,serviceNames}..]
         );
         const flat = Promise.all(proms);
         return flat;
-        // return clusterAndServices;
     };
-
-const serviceNameCallback =
+const parseServiceNames =
     function(data: AWS.ECS.Types.ListServicesResponse): string[] {
         var serviceNames: string[] = []
         if(data && data.serviceArns) {
@@ -83,14 +89,7 @@ const serviceNameCallback =
 }
 //      describe service
 //          AWS_PROFILE=prod aws ecs describe-services --service classic-api-prod --cluster meetup-prod-web-cluster
-export interface ServiceStatus {
-    serviceName: string;
-    desiredCount: number;
-    runningCount: number;
-    pendingCount: number;
-    launchType: string;
-}
-const serviceDescribeCalls = function(clusterAndServices: ClusterAndServices[]): Promise<ServiceStatus[]> {
+const describeServices = function(clusterAndServices: ClusterAndServices[]): Promise<ServiceStatus[]> {
     //console.log(clusterAndServices);
     const servicePromises: Promise<PromiseResult<AWS.ECS.DescribeServicesResponse, AWS.AWSError>[]> 
     = Promise.all(clusterAndServices.flatMap( (cAss) => {
@@ -98,11 +97,8 @@ const serviceDescribeCalls = function(clusterAndServices: ClusterAndServices[]):
         if(hasNoServices) {
             return [];
         }
-        return multiServiceDescribeCall(cAss.cluster, cAss.services);
-        //return cAss.services.map((service) => {return serviceDescribeCall(cAss.cluster, service);});
+        return fetchMultiServiceDescribeCall(cAss.cluster, cAss.services);
     }));
-    //.service[0].desiredCount
-
     const statusPromises: Promise<ServiceStatus[]> = servicePromises
         .then( (awsResults) => {
             return awsResults
@@ -125,16 +121,10 @@ const serviceDescribeCalls = function(clusterAndServices: ClusterAndServices[]):
                         });
                 });
         });
-    
     return statusPromises;
 };
 
-const multiServiceDescribeCall = function(clusterName: string, serviceNames: string[]):Promise<PromiseResult<AWS.ECS.DescribeServicesResponse, AWS.AWSError>> { 
-    return ecs.describeServices({cluster: clusterName, services: serviceNames}).promise();
-}
-
-//adder
-
+//takes a set of stats and sums them up into a single ServiceStatus
 const addStats = function(serviceStatuses: ServiceStatus[]): ServiceStatus {
     return serviceStatuses.reduce( (prev, curr) => {
         if(curr.launchType && curr.launchType == 'FARGATE') {
@@ -152,10 +142,22 @@ const addStats = function(serviceStatuses: ServiceStatus[]): ServiceStatus {
     }, EMPTY_SUMMARY);
 };
 
-const EMPTY_SUMMARY: ServiceStatus = {
-    serviceName: "total",
-    desiredCount: 0,
-    runningCount: 0,
-    pendingCount: 0,
-    launchType: "FARGATE"
+//calls to AWS
+AWS.config.update({region: 'us-east-1'});
+var credentials = new AWS.SharedIniFileCredentials({profile: 'prod'});
+AWS.config.credentials = credentials;
+const ecs = new AWS.ECS();
+
+const fetchServicesForCluster = function(clusterName: string) {
+    return ecs
+        .listServices({cluster: clusterName})
+        .promise();
+}
+
+const fetchMultiServiceDescribeCall = function(clusterName: string, serviceNames: string[]):Promise<PromiseResult<AWS.ECS.DescribeServicesResponse, AWS.AWSError>> { 
+    return ecs.describeServices({cluster: clusterName, services: serviceNames}).promise();
+}
+
+const fetchClusters = function(): Promise<PromiseResult<AWS.ECS.ListClustersRequest, AWS.AWSError>> {
+    return ecs.listClusters({}).promise();
 }
